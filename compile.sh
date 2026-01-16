@@ -2,7 +2,7 @@
 # Esse comando compila, executa e apaga o executavel em seguida.
 
 # Compila
-g++ test.cpp -o main
+g++ main.cpp -o main
 
 # Executa (Com parametro)
 ./main $1
