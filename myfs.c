@@ -181,6 +181,19 @@ int myFSIsIdle (Disk *d) {
 //com tamanho de blocos igual a blockSize. Retorna o numero total de
 //blocos disponiveis no disco, se formatado com sucesso. Caso contrario,
 //retorna -1.
+//
+// DETALHES DA IMPLEMENTACAO:
+// 1. Valida parametros e calcula layout do disco
+// 2. Cria superbloco com metadados do sistema de arquivos
+// 3. Inicializa bitmap de alocacao de blocos (todos livres)
+// 4. Cria estrutura de inodes (importante: inicializa TODOS os inodes)
+// 5. Configura inode do diretorio raiz
+//
+// LAYOUT DO DISCO:
+// Setor 0: Superbloco (metadados do FS)
+// Setor 1: Bitmap de blocos (controle de alocacao)
+// Setores 2+: Area de inodes (estruturas de metadados de arquivos)
+// Setores restantes: Area de dados (conteudo dos arquivos)
 int myFSFormat (Disk *d, unsigned int blockSize) {
     if (!d || blockSize == 0) return -1;
     
@@ -188,60 +201,67 @@ int myFSFormat (Disk *d, unsigned int blockSize) {
     if (numSectors < 4) return -1; // Precisa de pelo menos: superbloco, bitmap, inodes, dados
     
     // Calcula o tamanho do bloco em setores
+    // Um bloco e' a unidade de alocacao (pode conter multiplos setores)
     unsigned int blockSizeInSectors = blockSize / DISK_SECTORDATASIZE;
     if (blockSizeInSectors == 0) blockSizeInSectors = 1;
     
-    // Calcula area de inodes (comeca no setor 2)
-    unsigned int inodeAreaStart = inodeAreaBeginSector(); // Setor 2
-    unsigned int inodesPerSector = inodeNumInodesPerSector();
+    // Calcula area de inodes (comeca no setor 2, apos superbloco e bitmap)
+    unsigned int inodeAreaStart = inodeAreaBeginSector(); // Retorna 2
+    unsigned int inodesPerSector = inodeNumInodesPerSector(); // Quantos inodes cabem em 1 setor
     
-    // Define numero maximo de inodes (usando alguns setores apos bitmap)
-    // Reserva setores suficientes para ~64 inodes
+    // Define numero maximo de inodes
+    // Reserva setores suficientes para ~64 inodes (ajustavel conforme necessidade)
     unsigned int inodeSectors = (64 + inodesPerSector - 1) / inodesPerSector;
     unsigned int numInodes = inodeSectors * inodesPerSector;
     
-    // Primeiro setor de dados vem apos area de inodes
+    // Primeiro setor de dados vem logo apos a area de inodes
     unsigned int firstDataSector = inodeAreaStart + inodeSectors;
     
     // Calcula numero de blocos de dados disponiveis
+    // Cada bloco ocupa blockSizeInSectors setores consecutivos
     unsigned int dataSectors = numSectors - firstDataSector;
     unsigned int numBlocks = dataSectors / blockSizeInSectors;
     
-    // Limita pelo tamanho do bitmap (1 setor = 512 bytes = 4096 bits)
+    // Limita pelo tamanho do bitmap (1 setor = 512 bytes = 4096 bits max)
+    // Cada bit representa um bloco (1=ocupado, 0=livre)
     if (numBlocks > DISK_SECTORDATASIZE * 8) {
         numBlocks = DISK_SECTORDATASIZE * 8;
     }
     
     if (numBlocks == 0) return -1;
     
-    // Preenche o superbloco
-    superblock.magic = 0x4D595346; // "MYSF"
-    superblock.blockSize = blockSizeInSectors;
-    superblock.numBlocks = numBlocks;
-    superblock.firstDataBlock = firstDataSector;
-    superblock.numInodes = numInodes;
+    // Preenche o superbloco com informacoes do sistema de arquivos
+    superblock.magic = 0x4D595346; // Magic number "MYSF" para identificacao
+    superblock.blockSize = blockSizeInSectors; // Tamanho do bloco em setores
+    superblock.numBlocks = numBlocks; // Total de blocos de dados
+    superblock.firstDataBlock = firstDataSector; // Onde comeca a area de dados
+    superblock.numInodes = numInodes; // Maximo de arquivos/diretorios
     
-    // Salva o superbloco
+    // Salva o superbloco no setor 0
     if (saveSuperblock(d) < 0) return -1;
     
-    // Inicializa e salva o bitmap (todos os blocos livres)
+    // Inicializa bitmap com zeros (todos os blocos livres)
     memset(bitmap, 0, DISK_SECTORDATASIZE);
     if (saveBitmap(d) < 0) return -1;
     
-    // Inicializa todos os inodes (importante: inodeCreate coloca o number correto)
+    // IMPORTANTE: Inicializa todos os inodes com inodeCreate
+    // Isso garante que cada inode tenha seu campo 'number' correto
+    // inodeFindFreeInode procura inodes com blockAddr[0]==0, mas precisa
+    // que o campo 'number' esteja preenchido para funcionar corretamente
     for (unsigned int i = 1; i <= numInodes; i++) {
         Inode *inode = inodeCreate(i, d);
         if (!inode) return -1;
         free(inode);
     }
     
-    // Configura o inode do diretorio raiz (inode 1)
+    // Configura o inode 1 como diretorio raiz
+    // Todo sistema de arquivos Unix-like tem um diretorio raiz
     Inode *rootInode = inodeLoad(MYFS_ROOT_INODE, d);
     if (!rootInode) return -1;
     
-    inodeSetFileType(rootInode, FILETYPE_DIR);
-    inodeSetFileSize(rootInode, 0);
-    inodeSetRefCount(rootInode, 1);
+    inodeSetFileType(rootInode, FILETYPE_DIR); // Tipo diretorio
+    inodeSetFileSize(rootInode, 0); // Diretorio vazio inicialmente
+    inodeSetRefCount(rootInode, 1); // Uma referencia (o proprio sistema)
     
     if (inodeSave(rootInode) < 0) {
         free(rootInode);
@@ -296,14 +316,30 @@ int myFSxMount (Disk *d, int x) {
 //em path, no disco montado especificado em d, no modo Read/Write,
 //criando o arquivo se nao existir. Retorna um descritor de arquivo,
 //em caso de sucesso. Retorna -1, caso contrario.
-int myFSOpen (Disk *d, const char *path) {
-    if (!d || !path) return -1;
-    if (d != mountedDisk) return -1;
+//
+// DETALHES DA IMPLEMENTACAO:
+// 1. Busca o arquivo no diretorio raiz
+// 2. Se nao existir, cria novo arquivo (inode + entrada no diretorio)
+// 3. Aloca descritor de arquivo (fd) e retorna
+//
+// ESTRUTURA DE DIRETORIO:
+// Cada entrada tem 260 bytes: 4 bytes (numero do inode) + 256 bytes (nome)
+// As entradas sao armazenadas sequencialmente nos blocos do diretorio
+//
+// CONVFASE 1: BUSCA O ARQUIVO NO DIRETORIO RAIZ
+    // Carrega o inode do diretorio raiz (inode 1)
+    Inode *rootInode = inodeLoad(MYFS_ROOT_INODE, d);
+    if (!rootInode) return -1;
     
-    // Remove a barra inicial se existir (simplificacao: so diretorio raiz)
-    const char *filename = path;
-    if (filename[0] == '/') filename++;
+    unsigned int fileInodeNum = 0; // Sera preenchido se arquivo existir
+    unsigned int fileSize = inodeGetFileSize(rootInode); // Tamanho do diretorio em bytes
     
+    // Calcula tamanho de uma entrada de diretorio
+    // Formato: [4 bytes: numero do inode][256 bytes: nome do arquivo + \0]
+    unsigned int entrySize = sizeof(unsigned int) + MAX_FILENAME_LENGTH + 1;
+    unsigned int numEntries = fileSize / entrySize; // Quantas entradas existem
+    
+    // Percorre todas as entradas do diretorio raiz buscando o arquivo
     if (strlen(filename) == 0 || strlen(filename) > MAX_FILENAME_LENGTH) return -1;
     
     // Carrega o inode raiz para buscar o arquivo
@@ -317,119 +353,125 @@ int myFSOpen (Disk *d, const char *path) {
     unsigned int entrySize = sizeof(unsigned int) + MAX_FILENAME_LENGTH + 1;
     unsigned int numEntries = fileSize / entrySize;
     
-    // Busca o arquivo no diretorio raiz
-    for (unsigned int i = 0; i < numEntries && fileInodeNum == 0; i++) {
-        unsigned int entryOffset = i * entrySize;
-        unsigned int blockNum = entryOffset / (superblock.blockSize * DISK_SECTORDATASIZE);
-        unsigned int offsetInBlock = entryOffset % (superblock.blockSize * DISK_SECTORDATASIZE);
+    // B// Calcula onde esta a entrada i no disco
+        unsigned int entryOffset = i * entrySize; // Offset em bytes desde inicio do diretorio
+        unsigned int blockNum = entryOffset / (superblock.blockSize * DISK_SECTORDATASIZE); // Qual bloco
+        unsigned int offsetInBlock = entryOffset % (superblock.blockSize * DISK_SECTORDATASIZE); // Offset no bloco
         
+        // Obtem endereco do bloco no inode
+        // CONVENCAO: inodes armazenam blockAddr+1 (0 significa "nao alocado")
         unsigned int blockAddrStored = inodeGetBlockAddr(rootInode, blockNum);
-        if (blockAddrStored == 0) break;
+        if (blockAddrStored == 0) break; // Bloco nao alocado, fim do diretorio
         
-        unsigned int blockAddr = blockAddrStored - 1;  // Converte para indice real
-        unsigned int sectorAddr = blockToSector(blockAddr);
-        unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE;
-        unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE;
-        
+        unsigned int blockAddr = blockAddrStored - 1;  // Converte para indice real (0-based)
+        unsigned int sectorAddr = blockToSector(blockAddr); // Primeiro setor do bloco
+        unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE; // Qual setor dentro do bloco
+        unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE; // Offset dentro do setor
+        // Le o setor que contem a entrada
         unsigned char sector[DISK_SECTORDATASIZE];
         if (diskReadSector(d, sectorAddr + sectorOffset, sector) < 0) {
             free(rootInode);
             return -1;
         }
         
-        // Le o numero do inode
+        // Extrai o numero do inode (primeiros 4 bytes da entrada)
         unsigned int entryInode;
         char2ul(&sector[byteOffset], &entryInode);
         
-        // Le o nome do arquivo
+        // Extrai o nome do arquivo (proximos 256 bytes)
         char entryName[MAX_FILENAME_LENGTH + 1];
         memcpy(entryName, &sector[byteOffset + sizeof(unsigned int)], MAX_FILENAME_LENGTH + 1);
         
+        // Compara com o nome procurado
         if (strcmp(entryName, filename) == 0) {
-            fileInodeNum = entryInode;
+            fileInodeNum = entryInode; // Arquivo encontrado!
         }
     }
     
-    // Se o arquivo nao existe, cria um novo
+    // FASE 2: SE ARQUIVO NAO EXISTE, CRIA UM NOVO
     if (fileInodeNum == 0) {
-        // Encontra um inode livre
+        // 2.1: Aloca um inode livre para o novo arquivo
+        // Comeca do inode 2 (inode 1 e' o diretorio raiz)
         fileInodeNum = inodeFindFreeInode(MYFS_ROOT_INODE + 1, d);
         if (fileInodeNum == 0) {
             free(rootInode);
-            return -1;
+            return -1; // Sem inodes disponiveis
         }
         
-        // Cria o novo inode
+        // 2.2: Cria e inicializa o novo inode
         Inode *newInode = inodeCreate(fileInodeNum, d);
         if (!newInode) {
             free(rootInode);
             return -1;
         }
         
+        inodeSetFileType(newInode, FILETYPE_REGULAR); // Arquivo regular (nao diretorio)
+        inodeSetFileSize(newInode, 0); // Arquivo vazio
+        inodeSetRefCount(newInode, 1); // Uma referencia (a entrada do diretorio)
         inodeSetFileType(newInode, FILETYPE_REGULAR);
         inodeSetFileSize(newInode, 0);
         inodeSetRefCount(newInode, 1);
         
         if (inodeSave(newInode) < 0) {
-            free(newInode);
-            free(rootInode);
-            return -1;
-        }
-        free(newInode);
-        
-        // Adiciona entrada no diretorio raiz
-        unsigned int newEntryOffset = fileSize;
+           2.3: Adiciona entrada do novo arquivo no diretorio raiz
+        // A nova entrada vai no final do diretorio
+        unsigned int newEntryOffset = fileSize; // fileSize = tamanho atual do diretorio
         unsigned int blockNum = newEntryOffset / (superblock.blockSize * DISK_SECTORDATASIZE);
         unsigned int offsetInBlock = newEntryOffset % (superblock.blockSize * DISK_SECTORDATASIZE);
         
-        // Verifica se precisa de novo bloco
+        // Verifica se o diretorio ja tem um bloco alocado nesta posicao
         unsigned int blockAddrStored = inodeGetBlockAddr(rootInode, blockNum);
         unsigned int blockAddr;
         if (blockAddrStored == 0) {
-            // Aloca novo bloco
+            // Diretorio precisa de um novo bloco para a entrada
             unsigned int freeBlock = findFreeBlock();
             if (freeBlock == 0) {
                 free(rootInode);
-                return -1;
+                return -1; // Disco cheio
             }
-            blockAddr = freeBlock - 1;  // findFreeBlock retorna indice + 1
-            setBlockUsed(blockAddr);
+            blockAddr = freeBlock - 1;  // findFreeBlock retorna indice+1
+            setBlockUsed(blockAddr); // Marca bloco como ocupado no bitmap
             if (saveBitmap(d) < 0) {
                 free(rootInode);
                 return -1;
             }
-            // Armazena blockAddr + 1 no inode (0 = nao alocado)
+            // Adiciona bloco ao inode do diretorio
+            // CONVENCAO: armazena blockAddr+1 (0 = nao alocado)
             if (inodeAddBlock(rootInode, blockAddr + 1) < 0) {
                 free(rootInode);
                 return -1;
             }
         } else {
-            blockAddr = blockAddrStored - 1;  // Converte para indice real
-        }
-        
+            blockAddr = blockAddrStored - 1;  // Ja tem bloco, c= nao alocado)
+            if (inodeAddBlock(rootInode, blockAddr + 1) < 0) {
+                free(rootInode);
+                return -1;
+        // Calcula endereco do setor onde escrever a entrada
         unsigned int sectorAddr = blockToSector(blockAddr);
         unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE;
         unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE;
         
+        // Le o setor atual (pode ter outras entradas)
         unsigned char sector[DISK_SECTORDATASIZE];
         if (diskReadSector(d, sectorAddr + sectorOffset, sector) < 0) {
             free(rootInode);
             return -1;
         }
         
-        // Escreve o numero do inode
-        ul2char(fileInodeNum, &sector[byteOffset]);
+        // Escreve a entrada: [4 bytes: inode][256 bytes: nome]
+        ul2char(fileInodeNum, &sector[byteOffset]); // Numero do inode
         
-        // Escreve o nome do arquivo
+        // Escreve o nome do arquivo (preenche com zeros o restante)
         memset(&sector[byteOffset + sizeof(unsigned int)], 0, MAX_FILENAME_LENGTH + 1);
         strncpy((char*)&sector[byteOffset + sizeof(unsigned int)], filename, MAX_FILENAME_LENGTH);
         
+        // Grava o setor modificado de volta
         if (diskWriteSector(d, sectorAddr + sectorOffset, sector) < 0) {
             free(rootInode);
             return -1;
         }
         
-        // Atualiza tamanho do diretorio raiz
+        // Atualiza tamanho do diretorio (agora tem mais uma entrada)
         inodeSetFileSize(rootInode, fileSize + entrySize);
         if (inodeSave(rootInode) < 0) {
             free(rootInode);
@@ -439,13 +481,19 @@ int myFSOpen (Disk *d, const char *path) {
     
     free(rootInode);
     
-    // Encontra um descritor de arquivo livre
-    int fd = findFreeFD();
-    if (fd < 0) return -1;
+    // FASE 3: ALOCA UM DESCRITOR DE ARQUIVO (FD)
+    int fd = findFreeFD(); // Retorna valor de 1 a MAX_FDS
+    if (fd < 0) return -1; // Tabela de FDs cheia
     
-    // Configura o descritor (fd-1 porque fd vai de 1 a MAX_FDS)
+    // Configura o descritor de arquivo
+    // IMPORTANTE: fd e' 1-based, mas fdTable e' 0-based
     int idx = fd - 1;
-    fdTable[idx].isOpen = 1;
+    fdTable[idx].isOpen = 1; // Marca como aberto
+    fdTable[idx].inodeNumber = fileInodeNum; // Associa ao inode
+    fdTable[idx].cursor = 0; // Cursor no inicio do arquivo
+    fdTable[idx].disk = d; // Disco associado
+    
+    return fd; // Retorna descritor para o usuariox].isOpen = 1;
     fdTable[idx].inodeNumber = fileInodeNum;
     fdTable[idx].cursor = 0;
     fdTable[idx].disk = d;
@@ -453,12 +501,19 @@ int myFSOpen (Disk *d, const char *path) {
     return fd;
 }
 	
-//Funcao para a leitura de um arquivo, a partir de um descritor de arquivo
-//existente. Os dados devem ser lidos a partir da posicao atual do cursor
-//e copiados para buf. Terao tamanho maximo de nbytes. Ao fim, o cursor
-//deve ter posicao atualizada para que a proxima operacao ocorra a partir
-//do próximo byte apos o ultimo lido. Retorna o numero de bytes
-//efetivamente lidos em caso de sucesso ou -1, caso contrario.
+//
+// DETALHES DA IMPLEMENTACAO:
+// 1. Valida fd e converte para indice da tabela (fd-1)
+// 2. Calcula quantos bytes podem ser lidos (limita pelo tamanho do arquivo)
+// 3. Le dados bloco por bloco, setor por setor
+// 4. Atualiza cursor para proxima leitura
+//
+// ALGORITMO DE LEITURA:
+// - Posiciona no byte atual (cursor)
+// - Calcula qual bloco e offset dentro do bloco
+// - Le setor(es) necessarios
+// - Copia bytes para buffer
+// - Repete ate ler nbytes ou chegar no fim do arquivo
 int myFSRead (int fd, char *buf, unsigned int nbytes) {
     int idx = fd - 1;  // Converte fd (1-based) para indice (0-based)
     if (fd < 1 || fd > MAX_FDS || !fdTable[idx].isOpen || !buf) return -1;
@@ -466,40 +521,31 @@ int myFSRead (int fd, char *buf, unsigned int nbytes) {
     Disk *d = fdTable[idx].disk;
     if (!d) return -1;
     
+    // Carrega inode do arquivo para obter metadados
     Inode *inode = inodeLoad(fdTable[idx].inodeNumber, d);
     if (!inode) return -1;
     
     unsigned int fileSize = inodeGetFileSize(inode);
-    unsigned int cursor = fdTable[idx].cursor;
+    unsigned int cursor = fdTable[idx].cursor; // Posicao atual no arquivo
     
     // Verifica se ja esta no fim do arquivo
-    if (cursor >= fileSize) {
-        free(inode);
-        return 0;
-    }
-    
-    // Calcula quantos bytes podem ser lidos
-    unsigned int bytesToRead = nbytes;
-    if (cursor + bytesToRead > fileSize) {
-        bytesToRead = fileSize - cursor;
-    }
-    
-    unsigned int bytesRead = 0;
-    unsigned int blockDataSize = superblock.blockSize * DISK_SECTORDATASIZE;
-    
+    // Loop de leitura: processa bytes ate completar nbytes ou chegar no fim
     while (bytesRead < bytesToRead) {
+        // Calcula posicao atual no arquivo
         unsigned int currentPos = cursor + bytesRead;
-        unsigned int blockNum = currentPos / blockDataSize;
-        unsigned int offsetInBlock = currentPos % blockDataSize;
+        unsigned int blockNum = currentPos / blockDataSize; // Qual bloco logico
+        unsigned int offsetInBlock = currentPos % blockDataSize; // Offset dentro do bloco
         
+        // Obtem endereco fisico do bloco no disco
         unsigned int blockAddrStored = inodeGetBlockAddr(inode, blockNum);
-        if (blockAddrStored == 0) break;
+        if (blockAddrStored == 0) break; // Bloco nao alocado (fim inesperado)
         
-        unsigned int blockAddr = blockAddrStored - 1;  // Converte para indice real
-        unsigned int sectorAddr = blockToSector(blockAddr);
-        unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE;
-        unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE;
+        unsigned int blockAddr = blockAddrStored - 1;  // Converte para indice real (0-based)
+        unsigned int sectorAddr = blockToSector(blockAddr); // Primeiro setor do bloco
+        unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE; // Qual setor dentro do bloco
+        unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE; // Offset dentro do setor
         
+        // Le o setor que contem os dados
         unsigned char sector[DISK_SECTORDATASIZE];
         if (diskReadSector(d, sectorAddr + sectorOffset, sector) < 0) {
             free(inode);
@@ -507,27 +553,36 @@ int myFSRead (int fd, char *buf, unsigned int nbytes) {
         }
         
         // Calcula quantos bytes ler deste setor
+        // (pode nao ler o setor inteiro se comecar no meio ou terminar antes do fim)
         unsigned int bytesInSector = DISK_SECTORDATASIZE - byteOffset;
         if (bytesInSector > bytesToRead - bytesRead) {
-            bytesInSector = bytesToRead - bytesRead;
+            bytesInSector = bytesToRead - bytesRead; // Limita ao necessario
         }
         
+        // Copia bytes do setor para o buffer do usuario
         memcpy(&buf[bytesRead], &sector[byteOffset], bytesInSector);
         bytesRead += bytesInSector;
     }
     
+    // Atualiza cursor para proxima leitura/escrita
     fdTable[idx].cursor += bytesRead;
     free(inode);
     
-    return bytesRead;
-}
-
-//Funcao para a escrita de um arquivo, a partir de um descritor de arquivo
-//existente. Os dados de buf sao copiados para o disco a partir da posição
-//atual do cursor e terao tamanho maximo de nbytes. Ao fim, o cursor deve
-//ter posicao atualizada para que a proxima operacao ocorra a partir do
-//proximo byte apos o ultimo escrito. Retorna o numero de bytes
-//efetivamente escritos em caso de sucesso ou -1, caso contrario
+    return bytesRead; // Retorna quantos bytes foram efetivamente lidos
+        unsigned char sector[DISK_SECTORDATASIZE];
+        if (diskReadSector(d, sectorAddr + sectorOffset, sector) < 0) {
+            free(inode);
+//
+// DETALHES DA IMPLEMENTACAO:
+// 1. Valida fd e converte para indice da tabela
+// 2. Para cada posicao a escrever:
+//    - Verifica se bloco existe, senao aloca um novo
+//    - Le setor, modifica bytes necessarios, escreve de volta
+// 3. Atualiza cursor e tamanho do arquivo se cresceu
+//
+// ALOCACAO DINAMICA:
+// Blocos sao alocados sob demanda (lazy allocation)
+// Se escrever na posicao X e nao houver bloco, aloca automaticamente
 int myFSWrite (int fd, const char *buf, unsigned int nbytes) {
     int idx = fd - 1;  // Converte fd (1-based) para indice (0-based)
     if (fd < 1 || fd > MAX_FDS || !fdTable[idx].isOpen || !buf) return -1;
@@ -535,46 +590,86 @@ int myFSWrite (int fd, const char *buf, unsigned int nbytes) {
     Disk *d = fdTable[idx].disk;
     if (!d) return -1;
     
-    Inode *inode = inodeLoad(fdTable[idx].inodeNumber, d);
-    if (!inode) return -1;
-    
-    unsigned int fileSize = inodeGetFileSize(inode);
-    unsigned int cursor = fdTable[idx].cursor;
-    unsigned int bytesWritten = 0;
-    unsigned int blockDataSize = superblock.blockSize * DISK_SECTORDATASIZE;
-    
+    // Carrega inode do arquivo
+    // Loop de escrita: processa bytes ate completar nbytes ou disco cheio
     while (bytesWritten < nbytes) {
+        // Calcula posicao atual no arquivo
         unsigned int currentPos = cursor + bytesWritten;
-        unsigned int blockNum = currentPos / blockDataSize;
-        unsigned int offsetInBlock = currentPos % blockDataSize;
+        unsigned int blockNum = currentPos / blockDataSize; // Qual bloco logico
+        unsigned int offsetInBlock = currentPos % blockDataSize; // Offset dentro do bloco
         
+        // Verifica se o bloco ja esta alocado
         unsigned int blockAddrStored = inodeGetBlockAddr(inode, blockNum);
         unsigned int blockAddr;
         
-        // Se nao ha bloco alocado para esta posicao, aloca um novo
+        // ALOCACAO DINAMICA: Se bloco nao existe, aloca um novo
         if (blockAddrStored == 0) {
-            unsigned int freeBlock = findFreeBlock();
+            unsigned int freeBlock = findFreeBlock(); // Retorna indice+1 ou 0
             if (freeBlock == 0) {
-                // Sem blocos livres
+                // Disco cheio - para a escrita aqui
                 break;
             }
-            blockAddr = freeBlock - 1;  // findFreeBlock retorna indice + 1
+            blockAddr = freeBlock - 1;  // Converte para indice real (0-based)
+            
+            // Marca bloco como ocupado no bitmap
             setBlockUsed(blockAddr);
             if (saveBitmap(d) < 0) {
                 free(inode);
                 return -1;
             }
-            // Armazena blockAddr + 1 no inode (0 = nao alocado)
+            
+            // Adiciona bloco ao inode do arquivo
+            // CONVENCAO: armazena blockAddr+1 (0 = nao alocado)
             if (inodeAddBlock(inode, blockAddr + 1) < 0) {
                 free(inode);
                 return -1;
             }
-            // Recarrega o inode apos adicionar bloco
+            
+        // Calcula endereco do setor onde escrever
+        unsigned int sectorAddr = blockToSector(blockAddr);
+        unsigned int sectorOffset = offsetInBlock / DISK_SECTORDATASIZE;
+        unsigned int byteOffset = offsetInBlock % DISK_SECTORDATASIZE;
+        
+        // IMPORTANTE: Le o setor antes de escrever (read-modify-write)
+        // Pode estar escrevendo no meio de um setor com dados existentes
+        unsigned char sector[DISK_SECTORDATASIZE];
+        if (diskReadSector(d, sectorAddr + sectorOffset, sector) < 0) {
             free(inode);
-            inode = inodeLoad(fdTable[idx].inodeNumber, d);
-            if (!inode) return -1;
-        } else {
-            blockAddr = blockAddrStored - 1;  // Converte para indice real
+            return -1;
+        }
+        
+        // Calcula quantos bytes escrever neste setor
+        unsigned int bytesInSector = DISK_SECTORDATASIZE - byteOffset;
+        if (bytesInSector > nbytes - bytesWritten) {
+            bytesInSector = nbytes - bytesWritten;
+        }
+        
+        // Copia dados do buffer do usuario para o setor
+        memcpy(&sector[byteOffset], &buf[bytesWritten], bytesInSector);
+        
+        // Escreve setor modificado de volta para o disco
+        if (diskWriteSector(d, sectorAddr + sectorOffset, sector) < 0) {
+            free(inode);
+            return -1;
+        }
+        
+        bytesWritten += bytesInSector;
+    }
+    
+    // Atualiza cursor para proxima operacao
+    fdTable[idx].cursor += bytesWritten;
+    
+    // Se escreveu alem do tamanho atual, atualiza tamanho do arquivo
+    if (fdTable[idx].cursor > fileSize) {
+        inodeSetFileSize(inode, fdTable[idx].cursor);
+        if (inodeSave(inode) < 0) {
+            free(inode);
+            return -1;
+        }
+    }
+    
+    free(inode);
+    return bytesWritten; // Retorna quantos bytes foram efetivamente escritosblockAddrStored - 1;  // Converte para indice real
         }
         
         unsigned int sectorAddr = blockToSector(blockAddr);
